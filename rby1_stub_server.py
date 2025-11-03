@@ -2,6 +2,8 @@
 import time
 import grpc
 from concurrent import futures
+import numpy as np
+import threading
 
 # ----- SERVICE STUBS (services live here) -----
 import rb.api.robot_command_service_pb2_grpc      as rc_svc_grpc
@@ -18,6 +20,7 @@ import rb.api.control_manager_pb2                 as cm_pb
 import rb.api.power_pb2                           as pw_pb
 import rb.api.joint_operation_pb2                 as jo_pb
 import rb.api.parameter_pb2                       as pr_pb
+
 
 from decoder import decode_joint_position_commands
 
@@ -81,12 +84,40 @@ def extend_repeated_floats_if_present(msg, field_name, values):
         return True
     return False
 
-def pack_sdk_order():
+
+_state_lock = threading.RLock()
+_dof_names = []
+_index_map = {"torso": [], "right_arm": [], "left_arm": []}
+qpos_full = np.zeros(0, dtype=np.float64)
+
+def set_joint_layout(dof_names, index_map_dict):
+    """Called by the IsaacSim bridge once it knows the DOF order and segment indices."""
+    global _dof_names, _index_map, qpos_full, ROBOT_DOF
     with _state_lock:
-        t = qpos_full[TORSO_IDX]
-        r = qpos_full[RIGHT_IDX]
-        l = qpos_full[LEFT_IDX]
+        _dof_names = list(dof_names)
+        _index_map = {k: list(v) for k, v in index_map_dict.items()}
+        ROBOT_DOF = len(_dof_names) or ROBOT_DOF
+        if qpos_full.size != ROBOT_DOF:
+            qpos_full = np.zeros(ROBOT_DOF, dtype=np.float64)
+
+def update_qpos_from_sim(qvec):
+    """Push current IsaacSim joint positions (full-robot order)."""
+    global qpos_full
+    qvec = np.asarray(qvec, dtype=np.float64)
+    with _state_lock:
+        if qpos_full.size != qvec.size:
+            qpos_full = qvec.copy()
+        else:
+            qpos_full[:] = qvec
+
+def pack_sdk_order():
+    """Return torso + right_arm + left_arm concatenation for robot_state.* arrays."""
+    with _state_lock:
+        t = qpos_full[_index_map["torso"]] if _index_map["torso"] else np.array([], dtype=np.float64)
+        r = qpos_full[_index_map["right_arm"]] if _index_map["right_arm"] else np.array([], dtype=np.float64)
+        l = qpos_full[_index_map["left_arm"]] if _index_map["left_arm"] else np.array([], dtype=np.float64)
         return np.concatenate([t, r, l]).tolist()
+
 
 # ----------------- tiny in-memory "state" -----------------
 powered = False
@@ -101,6 +132,7 @@ ROBOT_DOF = 24
 class RobotCommandService(rc_svc_grpc.RobotCommandServiceServicer):
     def RobotCommand(self, request, context):
         cmds = decode_joint_position_commands(request)
+        print("[Server] command_q id:", id(command_q), "decoded cmds:", cmds)
         if cmds:
             enqueue_and_wait(cmds)
         resp = rc_pb.RobotCommandResponse()
@@ -249,17 +281,25 @@ class ParameterService(pr_svc_grpc.ParameterServiceServicer):
     def ResetParameterToDefault(self, req, ctx):     return pr_pb.ResetParameterToDefaultResponse()
 
 def serve():
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    import os
+    PORT = int(os.getenv("RBY_PORT", "50051"))  # allow override
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16),
+                         interceptors=[LoggingInterceptor()])
     rc_svc_grpc.add_RobotCommandServiceServicer_to_server(RobotCommandService(), server)
     rs_svc_grpc.add_RobotStateServiceServicer_to_server(RobotStateService(), server)
     cm_svc_grpc.add_ControlManagerServiceServicer_to_server(ControlManagerService(), server)
     pw_svc_grpc.add_PowerServiceServicer_to_server(PowerService(), server)
     jo_svc_grpc.add_JointOperationServiceServicer_to_server(JointOperationService(), server)
     pr_svc_grpc.add_ParameterServiceServicer_to_server(ParameterService(), server)
-    server.add_insecure_port("[::]:50051")
+
+    bound = server.add_insecure_port(f"[::]:{PORT}")
+    if bound == 0:
+        print(f"[Server] ERROR: failed to bind :{PORT} (port in use?)")
+        return
     server.start()
-    print("Stub RBY server (OK responses) on :50051")
+    print(f"[Server] Stub RBY server listening on :{PORT}")
     server.wait_for_termination()
+
 
 if __name__ == "__main__":
     serve()
