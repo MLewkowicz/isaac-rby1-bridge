@@ -19,7 +19,7 @@ def build_right_arm_req(rad7, seconds=3.0):
 
     # Right arm -> joint_position_command
     rac = bcbc.right_arm_command
-    jpc = rac.joint_position_command  # <-- sub-message, no need to construct a class
+    jpc = rac.joint_position_command
 
     # Fill fields
     jpc.position.extend(float(x) for x in rad7)
@@ -33,7 +33,7 @@ def build_right_arm_req(rad7, seconds=3.0):
 
 def main():
     # Example target: 7 DOFs (radians)
-    target = [0.0, math.radians(-5), 0.0, math.radians(-120), 0.0, math.radians(70), 0.0]
+    target = [0, math.radians(-120), 0.0, 0.0, 0.0, math.radians(70), 0.0]
     # target = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     channel = grpc.insecure_channel("localhost:50051")
